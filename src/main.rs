@@ -3,9 +3,10 @@ use std::{
     fs::{self, File},
     io::Write,
     path::PathBuf,
-    thread::{self, JoinHandle},
+    thread::{self},
 };
 
+use clap::Parser;
 use reqwest::{
     blocking::Client,
     header::{self, HeaderMap, HeaderValue},
@@ -22,29 +23,76 @@ fn download_file(client: Client, url: &str, file_path: PathBuf) -> Result<(), Bo
     Ok(())
 }
 
-fn download_chapter(client: Client, chapter_url: &str, chapter_num: usize) {
+fn download_chapter(client: Client, chapter_url: &str, chapter_title: &str, args: Args) {
     let response = client.get(chapter_url).send();
     if let Ok(result) = response {
         let html_content = result.text().unwrap_or_default();
         let doc = scraper::Html::parse_document(&html_content);
 
         let selector = Selector::parse("div>chapter-page img").unwrap();
-        let num_pages = doc.select(&selector).count();
+        let images = doc.select(&selector);
+        images
+            .into_iter()
+            .enumerate()
+            .for_each(|(page_num, image)| {
+                let page_url = image
+                    .attr("src")
+                    .unwrap_or(image.attr("data-src").unwrap_or_default());
 
-        for page_num in 1..=num_pages {
-            let page_url = format!(
-                "https://cdn.readdetectiveconan.com/file/mangap/3520/10{chapter_num:03}000/{page_num}.jpeg"
-            );
-            let page_path = PathBuf::from(format!(
-                "tmp/ranma/chapter_{chapter_num:03}/{page_num:02}.jpg"
-            ));
+                let page_path = PathBuf::from(format!(
+                    "tmp/{title}/{chapter_title}/{page_num:03}.jpg",
+                    title = args.title
+                ));
 
-            download_file(client.clone(), &page_url, page_path).unwrap();
-        }
+                download_file(client.clone(), page_url, page_path).unwrap();
+            });
     }
 }
 
+#[derive(Debug, Clone)]
+struct Chapter {
+    url: String,
+    title: String,
+}
+
+fn get_num_chapter_urls(client: Client, title_url: &str) -> Vec<Chapter> {
+    let response = client.get(title_url).send();
+    if let Ok(result) = response {
+        let html_content = result.text().unwrap_or_default();
+        let doc = scraper::Html::parse_document(&html_content);
+
+        let selector = Selector::parse("#chapters a").unwrap();
+        doc.select(&selector)
+            .map(|a| Chapter {
+                url: a.attr("href").unwrap_or_default().to_string(),
+                title: a
+                    .attr("title")
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase()
+                    .to_string(),
+            })
+            .collect()
+    } else {
+        vec![]
+    }
+}
+
+#[derive(Parser, Debug, Clone)]
+struct Args {
+    #[arg(short, long)]
+    title: String,
+
+    #[arg(long)]
+    id: usize,
+
+    #[arg(short = 'j', long, default_value_t = 1)]
+    threads: usize,
+}
+
 fn main() {
+    let args = Args::parse();
+
     let mut headers = HeaderMap::new();
     headers.insert(
         header::REFERER,
@@ -57,26 +105,37 @@ fn main() {
         .build()
         .unwrap();
 
-    for chapter_num in 1..=407 {
-        fs::create_dir_all(format!("tmp/ranma/chapter_{chapter_num:03}")).unwrap();
-    }
+    let title_url = format!(
+        "https://mangapill.com/manga/{id}/{title}",
+        id = args.id,
+        title = args.title
+    );
+    let chapters = get_num_chapter_urls(client.clone(), &title_url);
 
-    let mut handles = Vec::with_capacity(11);
-    for worker in 0..11 {
-        let client = client.clone();
-        handles.push(thread::spawn(move || {
-                let start = worker * 37 + 1;
-                let end = (worker + 1) * 37;
-                for chapter_num in start..=end {
-                    let chapter_url = format!(
-                        "https://mangapill.com/chapters/3520-10{chapter_num:03}000/ranma-chapter-{chapter_num}"
-                    );
-                    download_chapter(client.clone(), &chapter_url, chapter_num);
-                }
-            }));
-    }
+    chapters.iter().for_each(|Chapter { url: _, title }| {
+        fs::create_dir_all(format!("tmp/{book_title}/{title}", book_title = args.title)).unwrap();
+    });
 
-    handles
-        .into_iter()
-        .for_each(|handle| handle.join().unwrap());
+    let mut handles = vec![];
+    chapters
+        .chunks(chapters.len() / args.clone().threads)
+        .map(|c| c.to_owned())
+        .for_each(|chunk| {
+            let args = args.clone();
+            let client = client.clone();
+            handles.push(thread::spawn(move || {
+                let chunk_size = chunk.len();
+                chunk
+                    .iter()
+                    .enumerate()
+                    .for_each(|(i, Chapter { url, title })| {
+                        let chapter_url = format!("https://mangapill.com{url}");
+                        // println!("{chapter_url}");
+                        download_chapter(client.clone(), &chapter_url, title, args.clone());
+                        println!("downloaded {title:<13} {}/{}", i + 1, chunk_size);
+                    });
+            }))
+        });
+
+    handles.into_iter().for_each(|h| h.join().unwrap());
 }
