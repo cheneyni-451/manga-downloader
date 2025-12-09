@@ -123,7 +123,7 @@ fn download_chapters(
         total_progress.inc(1);
     }
 
-    chapter_progress.finish_and_clear();
+    chapter_progress.finish();
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -176,12 +176,15 @@ fn main() {
         "{spinner:.yellow} [{bar:60.yellow/white}] {pos:>4}/{len} chaps - {msg}",
     )
     .unwrap()
+    .tick_chars("\\|/- ")
     .progress_chars("-Cco");
     let total_progress = multi_progress.add(ProgressBar::new(num_chapters.try_into().unwrap()));
     total_progress.set_style(
-        ProgressStyle::with_template("  [{bar:60.green/blue}] {pos:>4}/{len} chaps")
-            .unwrap()
-            .progress_chars("▓▒░"),
+        ProgressStyle::with_template(
+            "  [{bar:60.green/blue}] {pos:>4}/{len} chaps [{elapsed_precise}]",
+        )
+        .unwrap()
+        .progress_chars("█▓▒░ "),
     );
     total_progress.tick();
 
