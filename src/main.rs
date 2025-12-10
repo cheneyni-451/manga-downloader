@@ -63,7 +63,7 @@ struct Chapter {
     title: String,
 }
 
-fn get_num_chapter_urls(client: &Client, title_url: &str) -> Vec<Chapter> {
+fn get_num_chapter_urls(client: &Client, title_url: &str, args: &Args) -> Vec<Chapter> {
     let response = client.get(title_url).send();
     if let Ok(result) = response {
         let html_content = result.text().unwrap_or_default();
@@ -71,6 +71,7 @@ fn get_num_chapter_urls(client: &Client, title_url: &str) -> Vec<Chapter> {
 
         let selector = Selector::parse("#chapters a").unwrap();
         doc.select(&selector)
+            .take(args.last_n)
             .map(|a| Chapter {
                 url: a.attr("href").unwrap_or_default().to_string(),
                 title: a
@@ -128,14 +129,23 @@ fn download_chapters(
 
 #[derive(Parser, Debug, Clone)]
 struct Args {
-    #[arg(short, long)]
+    #[arg(
+        required = true,
+        help = "Title of manga in the URL: mangapill.com/manga/<ID>/<TITLE>"
+    )]
     title: String,
 
-    #[arg(long)]
+    #[arg(
+        required = true,
+        help = "ID of manga in the URL: mangapill.com/manga/<ID>/<TITLE>"
+    )]
     id: usize,
 
     #[arg(short = 'j', long, default_value_t = 1)]
     threads: usize,
+
+    #[arg(short = 'n', long="last-n", default_value_t = usize::MAX)]
+    last_n: usize,
 }
 
 const HOST_URL: &str = "https://mangapill.com";
@@ -159,6 +169,7 @@ fn main() {
             id = args.id,
             title = args.title
         ),
+        &args,
     );
 
     let book_path = format!("tmp/{}", args.title);
