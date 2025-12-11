@@ -1,5 +1,6 @@
 use std::{
     error::Error,
+    fmt::Display,
     fs::{self, File},
     io::Write,
     path::PathBuf,
@@ -7,6 +8,7 @@ use std::{
 };
 
 use clap::Parser;
+use dialoguer::{Select, console::Style, theme::ColorfulTheme};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::{
     blocking::Client,
@@ -63,7 +65,13 @@ struct Chapter {
     title: String,
 }
 
-fn get_num_chapter_urls(client: &Client, title_url: &str, args: &Args) -> Vec<Chapter> {
+impl Display for Chapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.title)
+    }
+}
+
+fn fetch_chapters_urls(client: &Client, title_url: &str) -> Vec<Chapter> {
     let response = client.get(title_url).send();
     if let Ok(result) = response {
         let html_content = result.text().unwrap_or_default();
@@ -71,7 +79,6 @@ fn get_num_chapter_urls(client: &Client, title_url: &str, args: &Args) -> Vec<Ch
 
         let selector = Selector::parse("#chapters a").unwrap();
         doc.select(&selector)
-            .take(args.last_n)
             .map(|a| Chapter {
                 url: a.attr("href").unwrap_or_default().to_string(),
                 title: a
@@ -81,6 +88,7 @@ fn get_num_chapter_urls(client: &Client, title_url: &str, args: &Args) -> Vec<Ch
                     .to_ascii_lowercase()
                     .to_string(),
             })
+            .rev()
             .collect()
     } else {
         vec![]
@@ -143,9 +151,6 @@ struct Args {
 
     #[arg(short = 'j', long, default_value_t = 1)]
     threads: usize,
-
-    #[arg(short = 'n', long="last-n", default_value_t = usize::MAX)]
-    last_n: usize,
 }
 
 const HOST_URL: &str = "https://mangapill.com";
@@ -162,15 +167,34 @@ fn main() {
         .build()
         .unwrap();
 
-    let mut chapters = get_num_chapter_urls(
+    let mut chapters = fetch_chapters_urls(
         &client,
         &format!(
             "{HOST_URL}/manga/{id}/{title}",
             id = args.id,
             title = args.title
         ),
-        &args,
     );
+
+    let selection_theme = ColorfulTheme {
+        prompt_style: Style::default().blue(),
+        active_item_style: Style::default().reverse(),
+        ..Default::default()
+    };
+    let chapter_selection_start = Select::with_theme(&selection_theme)
+        .with_prompt("First of the chapters to download")
+        .items(&chapters)
+        .max_length(10)
+        .interact()
+        .unwrap();
+    chapters.drain(0..chapter_selection_start);
+    let chapter_selection_end = Select::with_theme(&selection_theme)
+        .with_prompt("Last of the chapters to download")
+        .items(&chapters)
+        .max_length(10)
+        .interact()
+        .unwrap();
+    chapters.truncate(chapter_selection_end + 1);
 
     let book_path = format!("tmp/{}", args.title);
 
