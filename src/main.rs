@@ -216,7 +216,7 @@ fn main() {
     let total_progress = multi_progress.add(ProgressBar::new(num_chapters.try_into().unwrap()));
     total_progress.set_style(
         ProgressStyle::with_template(
-            "  [{bar:60.green/blue}] {pos:>4}/{len} chaps [{elapsed_precise}]",
+            "  [{bar:60.green/blue}] {pos:>4}/{len} chaps [{elapsed_precise}]{msg}",
         )
         .unwrap()
         .progress_chars("█▓▒░ "),
@@ -241,5 +241,13 @@ fn main() {
     }
 
     threads.into_iter().for_each(|h| h.join().unwrap());
-    total_progress.finish_with_message(format!("downloaded {num_chapters} chapters to "));
+    total_progress.finish();
+    println!(
+        "\n\nDownloaded {num_chapters} {} to {book_path}/",
+        if num_chapters > 1 {
+            "chapters"
+        } else {
+            "chapter"
+        }
+    );
 }
