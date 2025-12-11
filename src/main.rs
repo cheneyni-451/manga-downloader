@@ -3,7 +3,8 @@ use std::{
     fmt::Display,
     fs::{self, File},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::exit,
     thread::{self},
 };
 
@@ -11,12 +12,13 @@ use clap::Parser;
 use dialoguer::{Select, console::Style, theme::ColorfulTheme};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::{
+    Url,
     blocking::Client,
     header::{self, HeaderMap, HeaderValue},
 };
 use scraper::Selector;
 
-fn download_file(client: &Client, url: &str, file_path: PathBuf) -> Result<(), Box<dyn Error>> {
+fn download_file(client: &Client, url: &str, file_path: &Path) -> Result<(), Box<dyn Error>> {
     let response = client.get(url).send()?;
     let content = response.bytes()?;
 
@@ -29,8 +31,7 @@ fn download_file(client: &Client, url: &str, file_path: PathBuf) -> Result<(), B
 fn download_chapter(
     client: &Client,
     chapter_url: &str,
-    chapter_title: &str,
-    args: &Args,
+    chapter_dst: &Path,
     progress_bar: &ProgressBar,
 ) {
     let response = client.get(chapter_url).send();
@@ -48,12 +49,9 @@ fn download_chapter(
                     .attr("src")
                     .unwrap_or_else(|| image.attr("data-src").unwrap_or_default());
 
-                let page_path = PathBuf::from(format!(
-                    "tmp/{title}/{chapter_title}/{page_num:03}.jpg",
-                    title = args.title
-                ));
+                let page_path = chapter_dst.join(format!("{page_num:03}.jpg"));
 
-                download_file(client, page_url, page_path).unwrap();
+                download_file(client, page_url, &page_path).unwrap();
                 progress_bar.tick();
             });
     }
@@ -110,10 +108,25 @@ fn split_jobs<T: Clone>(jobs: &mut Vec<T>, num_batches: usize) -> Vec<Vec<T>> {
     batches
 }
 
+fn get_title_from_id(client: &Client, id: usize) -> Option<(String, Url)> {
+    if let Ok(response) = client.get(format!("{HOST_URL}/manga/{id}")).send() {
+        let url = response.url();
+        match url.path_segments() {
+            Some(mut segments) => {
+                let title = segments.next_back().unwrap();
+                return Some((title.to_string(), url.clone()));
+            }
+            None => return None,
+        };
+    }
+
+    None
+}
+
 fn download_chapters(
     client: &Client,
-    args: &Args,
     chapters: &Vec<Chapter>,
+    manga_dst: &Path,
     chapter_progress: &ProgressBar,
     total_progress: &ProgressBar,
 ) {
@@ -126,7 +139,12 @@ fn download_chapters(
         chapter_progress.set_message(format!("downloading {chapter_title}"));
 
         let chapter_url = format!("{HOST_URL}{url}");
-        download_chapter(client, &chapter_url, chapter_title, args, chapter_progress);
+        download_chapter(
+            client,
+            &chapter_url,
+            &manga_dst.join(chapter_title),
+            chapter_progress,
+        );
 
         chapter_progress.inc(1);
         total_progress.inc(1);
@@ -137,12 +155,6 @@ fn download_chapters(
 
 #[derive(Parser, Debug, Clone)]
 struct Args {
-    #[arg(
-        required = true,
-        help = "Title of manga in the URL: mangapill.com/manga/<ID>/<TITLE>"
-    )]
-    title: String,
-
     #[arg(
         required = true,
         help = "ID of manga in the URL: mangapill.com/manga/<ID>/<TITLE>"
@@ -167,14 +179,14 @@ fn main() {
         .build()
         .unwrap();
 
-    let mut chapters = fetch_chapters_urls(
-        &client,
-        &format!(
-            "{HOST_URL}/manga/{id}/{title}",
-            id = args.id,
-            title = args.title
-        ),
-    );
+    let maybe_title = get_title_from_id(&client, args.id);
+    if maybe_title.is_none() {
+        println!("Invalid manga id");
+        exit(1);
+    }
+    let (title, title_url) = maybe_title.unwrap();
+
+    let mut chapters = fetch_chapters_urls(&client, title_url.as_ref());
 
     let selection_theme = ColorfulTheme {
         prompt_style: Style::default().blue(),
@@ -196,11 +208,11 @@ fn main() {
         .unwrap();
     chapters.truncate(chapter_selection_end + 1);
 
-    let book_path = format!("tmp/{}", args.title);
+    let book_path = PathBuf::from("tmp").join(title);
 
     let num_chapters = chapters.len();
     chapters.iter().for_each(|Chapter { url: _, title }| {
-        fs::create_dir_all(format!("{book_path}/{title}")).unwrap();
+        fs::create_dir_all(book_path.join(title)).unwrap();
     });
 
     let num_threads = args.threads.min(num_chapters);
@@ -226,8 +238,8 @@ fn main() {
     let mut threads = vec![];
 
     for batch in batches {
-        let args = args.clone();
         let client = client.clone();
+        let book_path = book_path.clone();
 
         let chapter_progress = ProgressBar::new(batch.len().try_into().unwrap());
         chapter_progress.set_style(multi_progress_style.clone());
@@ -236,18 +248,25 @@ fn main() {
         let total_progress = total_progress.clone();
 
         threads.push(thread::spawn(move || {
-            download_chapters(&client, &args, &batch, &chapter_progress, &total_progress)
+            download_chapters(
+                &client,
+                &batch,
+                &book_path,
+                &chapter_progress,
+                &total_progress,
+            )
         }));
     }
 
     threads.into_iter().for_each(|h| h.join().unwrap());
-    total_progress.finish();
-    println!(
-        "\n\nDownloaded {num_chapters} {} to {book_path}/",
+    total_progress.set_style(ProgressStyle::with_template("{msg}").unwrap());
+    total_progress.finish_with_message(format!(
+        "Downloaded {num_chapters} {} to {path}/",
         if num_chapters > 1 {
             "chapters"
         } else {
             "chapter"
-        }
-    );
+        },
+        path = book_path.as_os_str().display()
+    ));
 }
