@@ -76,6 +76,7 @@ fn fetch_chapters_urls(client: &Client, title_url: &str) -> Vec<Chapter> {
                         .trim()
                         .to_ascii_lowercase()
                         .to_string();
+                    title = title.replace('/', "-");
                     let chapter_num_pos = title.rfind(char::is_whitespace).unwrap_or_default();
                     let chapter_num_str = title.split_off(chapter_num_pos + 1);
                     let number_width = if let Some(i) = chapter_num_str.rfind('.') {
