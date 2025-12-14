@@ -69,14 +69,25 @@ fn fetch_chapters_urls(client: &Client, title_url: &str) -> Vec<Chapter> {
 
             let selector = Selector::parse("#chapters a").unwrap();
             doc.select(&selector)
-                .map(|a| Chapter {
-                    url: a.attr("href").unwrap_or_default().to_string(),
-                    title: a
+                .map(|a| {
+                    let mut title = a
                         .attr("title")
                         .unwrap_or_default()
                         .trim()
                         .to_ascii_lowercase()
-                        .to_string(),
+                        .to_string();
+                    let chapter_num_pos = title.rfind(char::is_whitespace).unwrap_or_default();
+                    let chapter_num_str = title.split_off(chapter_num_pos + 1);
+                    let number_width = if let Some(i) = chapter_num_str.rfind('.') {
+                        chapter_num_str.len() - i + 4
+                    } else {
+                        4
+                    };
+
+                    Chapter {
+                        url: a.attr("href").unwrap_or_default().to_string(),
+                        title: format!("{title}{chapter_num_str:0>number_width$}"),
+                    }
                 })
                 .rev()
                 .collect()
@@ -214,15 +225,12 @@ fn main() {
         fs::create_dir_all(book_path.join(title)).unwrap();
     }
 
-    let num_threads = args.threads.min(num_chapters);
-    let batches = split_jobs(&mut selected_chapters, num_threads);
-
     let multi_progress = MultiProgress::new();
     let multi_progress_style = ProgressStyle::with_template(
         "{spinner:.yellow} [{bar:60.yellow/white}] {pos:>4}/{len} chaps - {msg}",
     )
     .unwrap()
-    .tick_chars("⣦⣇⡏⠟⠻⢹⣸⣴ ")
+    .tick_chars("⠒⠖⠔⠴⠤⠦⠢⠲ ")
     .progress_chars("-Cco");
     let total_progress = multi_progress.add(ProgressBar::new(num_chapters.try_into().unwrap()));
     total_progress.set_style(
@@ -236,13 +244,18 @@ fn main() {
 
     let mut threads = vec![];
 
+    let num_threads = args.threads.min(num_chapters);
+    let batches = split_jobs(&mut selected_chapters, num_threads);
+
     for batch in batches {
         let client = client.clone();
         let book_path = book_path.clone();
 
-        let chapter_progress = ProgressBar::new(batch.len().try_into().unwrap());
-        chapter_progress.set_style(multi_progress_style.clone());
-        let chapter_progress = multi_progress.insert_before(&total_progress, chapter_progress);
+        let chapter_progress = multi_progress.insert_before(
+            &total_progress,
+            ProgressBar::new(batch.len().try_into().unwrap())
+                .with_style(multi_progress_style.clone()),
+        );
 
         let total_progress = total_progress.clone();
 
