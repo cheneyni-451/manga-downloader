@@ -1,4 +1,4 @@
-use std::{error::Error, fmt::Display, fs, io::Write, path::Path, thread};
+use std::{error::Error, fmt::Display, fs, io::Write, path::Path, thread, time::Duration};
 
 use clap::Parser;
 use dialoguer::{Select, console::Style, theme::ColorfulTheme};
@@ -233,15 +233,16 @@ fn main() {
     .unwrap()
     .tick_chars("⠒⠖⠔⠴⠤⠦⠢⠲ ")
     .progress_chars("-Cco");
-    let total_progress = multi_progress.add(ProgressBar::new(num_chapters.try_into().unwrap()));
-    total_progress.set_style(
-        ProgressStyle::with_template(
-            "  [{bar:60.green/blue}] {pos:>4}/{len} chaps [{elapsed_precise}]{msg}",
-        )
-        .unwrap()
-        .progress_chars("█▓▒░ "),
+    let total_progress = multi_progress.add(
+        ProgressBar::new(num_chapters.try_into().unwrap()).with_style(
+            ProgressStyle::with_template(
+                "  [{bar:60.green/blue}] {pos:>4}/{len} chaps [{elapsed_precise}]{msg}",
+            )
+            .unwrap()
+            .progress_chars("█▓▒░ "),
+        ),
     );
-    total_progress.tick();
+    total_progress.enable_steady_tick(Duration::from_millis(250));
 
     let mut threads = vec![];
 
