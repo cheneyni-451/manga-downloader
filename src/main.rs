@@ -1,4 +1,8 @@
-use std::{fmt::Display, fs, io::Write, path::Path, time::Duration};
+use std::{
+    fmt::Display,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use clap::Parser;
 use dialoguer::{Select, console::Style, theme::ColorfulTheme};
@@ -9,6 +13,7 @@ use reqwest::{
     header::{self, HeaderMap, HeaderValue},
 };
 use scraper::Selector;
+use tokio::{fs, io::AsyncWriteExt};
 
 use crate::errors::ScraperErrors;
 
@@ -21,23 +26,16 @@ async fn download_file(
     page_num: usize,
     progress_bar: &ProgressBar,
 ) -> anyhow::Result<()> {
-    match client.get(url).send().await {
-        Ok(response) => match response.bytes().await {
-            Ok(content) => {
-                let file_path = chapter_path.join(format!("{page_num:03}.jpg"));
-                let mut downloaded_file = fs::File::create(file_path)?;
-                downloaded_file.write_all(&content)?;
-                progress_bar.tick();
+    let fetch_image = async move || client.get(url).send().await?.bytes().await;
+    match fetch_image().await {
+        Ok(data) => {
+            let file_path = chapter_path.join(format!("{page_num:03}.jpg"));
+            let mut downloaded_file = fs::File::create(file_path).await?;
+            downloaded_file.write_all(&data).await?;
+            progress_bar.tick();
 
-                Ok(())
-            }
-            Err(_) => Err(ScraperErrors::PageDownloadFailed {
-                url: url.to_string(),
-                chapter_path: chapter_path.to_path_buf(),
-                page_num,
-            }
-            .into()),
-        },
+            Ok(())
+        }
         Err(_) => Err(ScraperErrors::PageDownloadFailed {
             url: url.to_string(),
             chapter_path: chapter_path.to_path_buf(),
@@ -53,35 +51,48 @@ async fn download_chapter(
     chapter_path: &Path,
     progress_bar: &ProgressBar,
 ) -> anyhow::Result<Vec<usize>> {
-    let html_content = client.get(chapter_url).send().await?.text().await?;
+    async fn fetch_image_urls(client: &Client, chapter_url: &str) -> anyhow::Result<Vec<String>> {
+        let html_content = client.get(chapter_url).send().await?.text().await?;
 
-    let image_urls = tokio::task::spawn_blocking(async move || {
         let doc = scraper::Html::parse_document(&html_content);
 
         let selector = Selector::parse("div>chapter-page img").unwrap();
         let images = doc.select(&selector);
-        images
+        Ok(images
             .map(|img| {
                 img.attr("src")
                     .unwrap_or_else(|| img.attr("data-src").unwrap_or_default())
                     .to_string()
             })
-            .collect::<Vec<String>>()
-    })
-    .await?
-    .await;
+            .collect::<Vec<String>>())
+    }
+    let image_urls = fetch_image_urls(client, chapter_url).await?;
 
-    let tasks = image_urls
-        .into_iter()
+    let tasks = futures::stream::iter(image_urls)
         .enumerate()
         .map(|(page_num, page_url)| async move {
             download_file(client, &page_url, chapter_path, page_num, progress_bar).await
-        });
+        })
+        .buffer_unordered(10);
 
-    let stream = futures::stream::iter(tasks).buffer_unordered(10);
-    let results = stream.collect::<Vec<_>>().await;
+    let results = tasks.collect::<Vec<_>>().await;
+    let failed_pages = results
+        .into_iter()
+        .filter_map(|result| -> Option<usize> {
+            match result {
+                Err(err) => {
+                    if let Ok(ScraperErrors::PageDownloadFailed { page_num, .. }) = err.downcast() {
+                        Some(page_num)
+                    } else {
+                        None
+                    }
+                }
+                Ok(_) => None,
+            }
+        })
+        .collect();
 
-    Ok(vec![])
+    Ok(failed_pages)
 }
 
 #[derive(Debug, Clone)]
@@ -244,7 +255,7 @@ struct Args {
 const HOST_URL: &str = "https://mangapill.com";
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let mut headers = HeaderMap::new();
@@ -270,8 +281,9 @@ async fn main() {
 
     let num_chapters = selected_chapters.len();
     for Chapter { title, .. } in &selected_chapters {
-        fs::create_dir_all(book_path.join(title)).unwrap();
+        fs::create_dir_all(book_path.join(title)).await?;
     }
+    fs::create_dir_all(PathBuf::from("output")).await?;
 
     let multi_progress = MultiProgress::new();
     let multi_progress_style = ProgressStyle::with_template(
@@ -335,4 +347,6 @@ async fn main() {
         },
         path = book_path.as_os_str().display()
     ));
+
+    Ok(())
 }
