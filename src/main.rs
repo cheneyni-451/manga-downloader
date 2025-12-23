@@ -1,52 +1,87 @@
-use std::{error::Error, fmt::Display, fs, io::Write, path::Path, thread, time::Duration};
+use std::{fmt::Display, fs, io::Write, path::Path, time::Duration};
 
 use clap::Parser;
 use dialoguer::{Select, console::Style, theme::ColorfulTheme};
+use futures::stream::StreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::{
-    Url,
-    blocking::Client,
+    Client, Url,
     header::{self, HeaderMap, HeaderValue},
 };
 use scraper::Selector;
 
-fn download_file(client: &Client, url: &str, file_path: &Path) -> Result<(), Box<dyn Error>> {
-    let response = client.get(url).send()?;
-    let content = response.bytes()?;
+use crate::errors::ScraperErrors;
 
-    let mut downloaded_file = fs::File::create(file_path)?;
-    downloaded_file.write_all(&content)?;
+mod errors;
 
-    Ok(())
+async fn download_file(
+    client: &Client,
+    url: &str,
+    chapter_path: &Path,
+    page_num: usize,
+    progress_bar: &ProgressBar,
+) -> anyhow::Result<()> {
+    match client.get(url).send().await {
+        Ok(response) => match response.bytes().await {
+            Ok(content) => {
+                let file_path = chapter_path.join(format!("{page_num:03}.jpg"));
+                let mut downloaded_file = fs::File::create(file_path)?;
+                downloaded_file.write_all(&content)?;
+                progress_bar.tick();
+
+                Ok(())
+            }
+            Err(_) => Err(ScraperErrors::PageDownloadFailed {
+                url: url.to_string(),
+                chapter_path: chapter_path.to_path_buf(),
+                page_num,
+            }
+            .into()),
+        },
+        Err(_) => Err(ScraperErrors::PageDownloadFailed {
+            url: url.to_string(),
+            chapter_path: chapter_path.to_path_buf(),
+            page_num,
+        }
+        .into()),
+    }
 }
 
-fn download_chapter(
+async fn download_chapter(
     client: &Client,
     chapter_url: &str,
     chapter_path: &Path,
     progress_bar: &ProgressBar,
-) {
-    let response = client.get(chapter_url).send();
-    if let Ok(result) = response {
-        let html_content = result.text().unwrap_or_default();
+) -> anyhow::Result<Vec<usize>> {
+    let html_content = client.get(chapter_url).send().await?.text().await?;
+
+    let image_urls = tokio::task::spawn_blocking(async move || {
         let doc = scraper::Html::parse_document(&html_content);
 
         let selector = Selector::parse("div>chapter-page img").unwrap();
         let images = doc.select(&selector);
         images
-            .into_iter()
-            .enumerate()
-            .for_each(|(page_num, image)| {
-                let page_url = image
-                    .attr("src")
-                    .unwrap_or_else(|| image.attr("data-src").unwrap_or_default());
+            .map(|img| {
+                img.attr("src")
+                    .unwrap_or_else(|| img.attr("data-src").unwrap_or_default())
+                    .to_string()
+            })
+            .collect::<Vec<String>>()
+    })
+    .await?
+    .await;
 
-                let page_path = chapter_path.join(format!("{page_num:03}.jpg"));
+    let tasks = image_urls
+        .into_iter()
+        .enumerate()
+        .map(|(page_num, page_url)| async move {
+            download_file(client, &page_url, chapter_path, page_num, progress_bar).await
+        });
 
-                download_file(client, page_url, &page_path).unwrap();
-                progress_bar.tick();
-            });
-    }
+    let stream = futures::stream::iter(tasks).buffer_unordered(10);
+    let results = stream.collect::<Vec<_>>().await;
+
+    Ok(vec![])
 }
 
 #[derive(Debug, Clone)]
@@ -61,10 +96,15 @@ impl Display for Chapter {
     }
 }
 
-fn fetch_chapters_urls(client: &Client, title_url: &str) -> Vec<Chapter> {
-    match client.get(title_url).send() {
+async fn fetch_chapters_urls(client: &Client, title_url: &str) -> Vec<Chapter> {
+    match client.get(title_url).send().await {
         Ok(response) => {
-            let html_content = response.text().unwrap_or_default();
+            let response_text = response.text().await;
+            if response_text.is_err() {
+                return vec![];
+            }
+
+            let html_content = response_text.unwrap();
             let doc = scraper::Html::parse_document(&html_content);
 
             let selector = Selector::parse("#chapters a").unwrap();
@@ -116,19 +156,16 @@ fn split_jobs<T: Clone>(jobs: &mut Vec<T>, num_batches: usize) -> Vec<Vec<T>> {
     batches
 }
 
-fn get_title_from_id(client: &Client, id: usize) -> Option<(String, Url)> {
-    if let Ok(response) = client.get(format!("{HOST_URL}/manga/{id}")).send() {
-        let url = response.url();
-        match url.path_segments() {
-            Some(mut segments) => {
-                let title = segments.next_back().unwrap();
-                return Some((title.to_string(), url.clone()));
-            }
-            None => return None,
-        };
+async fn get_title_from_id(client: &Client, id: usize) -> anyhow::Result<(String, Url)> {
+    let response = client.get(format!("{HOST_URL}/manga/{id}")).send().await?;
+    let url = response.url();
+    match url.path_segments() {
+        Some(mut segments) => {
+            let title = segments.next_back().unwrap();
+            Ok((title.to_string(), url.clone()))
+        }
+        None => Err(ScraperErrors::InvalidBookId(id).into()),
     }
-
-    None
 }
 
 fn select_chapters(mut chapters: Vec<Chapter>) -> Vec<Chapter> {
@@ -155,7 +192,7 @@ fn select_chapters(mut chapters: Vec<Chapter>) -> Vec<Chapter> {
     chapters
 }
 
-fn download_chapters(
+async fn download_chapters(
     client: &Client,
     chapters: &Vec<Chapter>,
     manga_path: &Path,
@@ -171,12 +208,19 @@ fn download_chapters(
         chapter_progress.set_message(format!("downloading {chapter_title}"));
 
         let chapter_url = format!("{HOST_URL}{url}");
-        download_chapter(
+        match download_chapter(
             client,
             &chapter_url,
             &manga_path.join(chapter_title),
             chapter_progress,
-        );
+        )
+        .await
+        {
+            Ok(_failed_pages) => {}
+            Err(err) => {
+                eprintln!("{err}")
+            }
+        }
 
         chapter_progress.inc(1);
         total_progress.inc(1);
@@ -199,7 +243,8 @@ struct Args {
 
 const HOST_URL: &str = "https://mangapill.com";
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args = Args::parse();
 
     let mut headers = HeaderMap::new();
@@ -211,12 +256,14 @@ fn main() {
         .build()
         .unwrap();
 
-    let (title, title_url) = get_title_from_id(&client, args.id).unwrap_or_else(|| {
-        eprintln!("Invalid manga id: {}", args.id);
-        std::process::exit(1);
-    });
+    let (title, title_url) = get_title_from_id(&client, args.id)
+        .await
+        .unwrap_or_else(|err| {
+            eprintln!("{err}");
+            std::process::exit(1);
+        });
 
-    let all_chapters = fetch_chapters_urls(&client, title_url.as_ref());
+    let all_chapters = fetch_chapters_urls(&client, title_url.as_ref()).await;
     let mut selected_chapters = select_chapters(all_chapters);
 
     let book_path = Path::new("tmp").join(title);
@@ -244,11 +291,10 @@ fn main() {
     );
     total_progress.enable_steady_tick(Duration::from_millis(250));
 
-    let mut threads = vec![];
-
     let num_threads = args.threads.min(num_chapters);
     let batches = split_jobs(&mut selected_chapters, num_threads);
 
+    let mut tasks: Vec<_> = vec![];
     for batch in batches {
         let client = client.clone();
         let book_path = book_path.clone();
@@ -261,7 +307,7 @@ fn main() {
 
         let total_progress = total_progress.clone();
 
-        threads.push(thread::spawn(move || {
+        tasks.push(tokio::spawn(async move {
             download_chapters(
                 &client,
                 &batch,
@@ -269,10 +315,16 @@ fn main() {
                 &chapter_progress,
                 &total_progress,
             )
+            .await
         }));
     }
 
-    threads.into_iter().for_each(|h| h.join().unwrap());
+    for task in tasks {
+        if let Err(e) = task.await {
+            eprintln!("error: {e}");
+        }
+    }
+
     total_progress.set_style(ProgressStyle::with_template("{msg}").unwrap());
     total_progress.finish_with_message(format!(
         "Downloaded {num_chapters} {} to {path}/",
