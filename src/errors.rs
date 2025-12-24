@@ -13,4 +13,7 @@ pub enum ScraperErrors {
 
     #[error("failed to get title for id: {0}")]
     InvalidBookId(usize),
+
+    #[error("incomplete chapter selection")]
+    InvalidChapterSelection,
 }

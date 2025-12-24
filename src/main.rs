@@ -11,7 +11,7 @@ use reqwest::{
     header::{self, HeaderMap, HeaderValue},
 };
 use scraper::Selector;
-use tokio::{fs, io::AsyncWriteExt, time::sleep};
+use tokio::{fs, io::AsyncWriteExt};
 
 use crate::errors::ScraperErrors;
 
@@ -192,7 +192,7 @@ async fn get_manga_display_name(client: &Client, url: &str) -> anyhow::Result<Op
         .map(|e| e.text().collect::<String>()))
 }
 
-fn select_chapters(mut chapters: Vec<Chapter>) -> Vec<Chapter> {
+fn select_chapters(mut chapters: Vec<Chapter>) -> anyhow::Result<Vec<Chapter>> {
     let selection_theme = ColorfulTheme {
         prompt_style: Style::default().blue(),
         active_item_style: Style::default().reverse(),
@@ -202,18 +202,26 @@ fn select_chapters(mut chapters: Vec<Chapter>) -> Vec<Chapter> {
         .with_prompt("First of the chapters to download")
         .items(&chapters)
         .max_length(10)
-        .interact()
-        .unwrap();
-    chapters.drain(0..chapter_selection_start);
+        .interact_opt()?;
+    match chapter_selection_start {
+        Some(start_selection) => {
+            chapters.drain(..start_selection);
+        }
+        None => return Err(ScraperErrors::InvalidChapterSelection.into()),
+    };
+
     let chapter_selection_end = Select::with_theme(&selection_theme)
         .with_prompt("Last of the chapters to download")
         .items(&chapters)
         .max_length(10)
-        .interact()
-        .unwrap();
-    chapters.truncate(chapter_selection_end + 1);
-
-    chapters
+        .interact_opt()?;
+    match chapter_selection_end {
+        Some(end_selection) => {
+            chapters.truncate(end_selection.saturating_add(1));
+            Ok(chapters)
+        }
+        None => Err(ScraperErrors::InvalidChapterSelection.into()),
+    }
 }
 
 async fn download_chapters(
@@ -339,7 +347,14 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let mut selected_chapters = select_chapters(all_chapters);
+    let mut selected_chapters = match select_chapters(all_chapters) {
+        Ok(selected_chapters) => selected_chapters,
+        Err(err) => {
+            debug!("{err}");
+            error!("failed to select chapters");
+            std::process::exit(1);
+        }
+    };
 
     let book_path = Path::new("tmp").join(title);
 
