@@ -1,3 +1,4 @@
 target/
 tmp/
 .vscode/
+log.txt
