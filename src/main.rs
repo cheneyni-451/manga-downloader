@@ -205,6 +205,7 @@ fn select_chapters(mut chapters: Vec<Chapter>) -> anyhow::Result<Vec<Chapter>> {
         .interact_opt()?;
     match chapter_selection_start {
         Some(start_selection) => {
+            debug!("selected chapter range start index: {start_selection}");
             chapters.drain(..start_selection);
         }
         None => return Err(ScraperErrors::InvalidChapterSelection.into()),
@@ -217,6 +218,7 @@ fn select_chapters(mut chapters: Vec<Chapter>) -> anyhow::Result<Vec<Chapter>> {
         .interact_opt()?;
     match chapter_selection_end {
         Some(end_selection) => {
+            debug!("selected chapter range end index: {end_selection}");
             chapters.truncate(end_selection.saturating_add(1));
             Ok(chapters)
         }
@@ -348,7 +350,14 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let mut selected_chapters = match select_chapters(all_chapters) {
-        Ok(selected_chapters) => selected_chapters,
+        Ok(selected_chapters) => {
+            info!(
+                "selected chapters [{} - {}]",
+                selected_chapters.first().unwrap().title,
+                selected_chapters.last().unwrap().title
+            );
+            selected_chapters
+        }
         Err(err) => {
             debug!("{err}");
             error!("failed to select chapters");
