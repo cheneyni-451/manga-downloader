@@ -1,116 +1,30 @@
-use std::{fmt::Display, io::Write, path::Path, time::Duration};
+use std::{io::Write, path::Path, str::FromStr, time::Duration};
 
 use chrono::Local;
 use clap::Parser;
 use dialoguer::{Select, console::Style, theme::ColorfulTheme};
-use futures::stream::StreamExt;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use futures::StreamExt;
+use indicatif::{ProgressBar, ProgressStyle};
+use lapin::{
+    BasicProperties, Connection, ConnectionProperties,
+    options::{
+        BasicAckOptions, BasicCancelOptions, BasicConsumeOptions, BasicPublishOptions,
+        QueueDeclareOptions, QueuePurgeOptions,
+    },
+    protocol::confirm,
+    types::FieldTable,
+    uri::AMQPUri,
+};
 use log::{debug, error, info};
 use reqwest::{
     Client, Url,
     header::{self, HeaderMap, HeaderValue},
 };
+use rkyv::rancor;
 use scraper::Selector;
-use tokio::{fs, io::AsyncWriteExt};
+use tokio::{fs, task::JoinHandle};
 
-use crate::errors::ScraperErrors;
-
-mod errors;
-
-async fn download_file(
-    client: &Client,
-    url: &str,
-    chapter_path: &Path,
-    page_num: usize,
-    progress_bar: &ProgressBar,
-) -> anyhow::Result<()> {
-    let fetch_image = async move || client.get(url).send().await?.bytes().await;
-    match fetch_image().await {
-        Ok(data) => {
-            let file_path = chapter_path.join(format!("{page_num:03}.jpg"));
-            let mut downloaded_file = fs::File::create(file_path).await?;
-            downloaded_file.write_all(&data).await?;
-            progress_bar.tick();
-
-            Ok(())
-        }
-        Err(_) => Err(ScraperErrors::PageDownloadFailed {
-            url: url.to_string(),
-            chapter_path: chapter_path.to_path_buf(),
-            page_num,
-        }
-        .into()),
-    }
-}
-
-async fn download_chapter(
-    client: &Client,
-    chapter_url: &str,
-    chapter_path: &Path,
-    progress_bar: &ProgressBar,
-) -> anyhow::Result<Vec<usize>> {
-    async fn fetch_image_urls(client: &Client, chapter_url: &str) -> anyhow::Result<Vec<String>> {
-        let html_content = client.get(chapter_url).send().await?.text().await?;
-
-        let doc = scraper::Html::parse_document(&html_content);
-
-        let selector = Selector::parse("div>chapter-page img").unwrap();
-        let images = doc.select(&selector);
-        Ok(images
-            .enumerate()
-            .filter_map(|(i, img)| {
-                img.attr("src")
-                    .or_else(|| img.attr("data-src"))
-                    .or_else(|| {
-                        debug!("img element with missing url: {img:?}");
-                        error!("failed to extract url for page {}", i + 1);
-                        None
-                    })
-                    .map(str::to_string)
-            })
-            .collect::<Vec<String>>())
-    }
-
-    let image_urls = fetch_image_urls(client, chapter_url).await?;
-
-    let tasks = futures::stream::iter(image_urls)
-        .enumerate()
-        .map(|(page_num, page_url)| async move {
-            download_file(client, &page_url, chapter_path, page_num, progress_bar).await
-        })
-        .buffer_unordered(6);
-
-    let results = tasks.collect::<Vec<_>>().await;
-    let failed_pages = results
-        .into_iter()
-        .filter_map(|result| -> Option<usize> {
-            match result {
-                Err(err) => {
-                    if let Ok(ScraperErrors::PageDownloadFailed { page_num, .. }) = err.downcast() {
-                        Some(page_num)
-                    } else {
-                        None
-                    }
-                }
-                Ok(_) => None,
-            }
-        })
-        .collect();
-
-    Ok(failed_pages)
-}
-
-#[derive(Debug, Clone)]
-struct Chapter {
-    url: String,
-    title: String,
-}
-
-impl Display for Chapter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.title)
-    }
-}
+use mangapill_scraper::{errors::ScraperErrors, models::Chapter};
 
 async fn fetch_chapters_urls(client: &Client, title_url: &str) -> anyhow::Result<Vec<Chapter>> {
     let html_content = client.get(title_url).send().await?.text().await?;
@@ -142,23 +56,6 @@ async fn fetch_chapters_urls(client: &Client, title_url: &str) -> anyhow::Result
         })
         .rev()
         .collect())
-}
-
-fn split_jobs<T: Clone>(jobs: &mut Vec<T>, num_batches: usize) -> Vec<Vec<T>> {
-    let n = jobs.len();
-
-    let chunk_size = n / num_batches;
-
-    let mut batches = Vec::with_capacity(num_batches);
-    for _ in 0..(n % num_batches) {
-        let batch = jobs.split_off(jobs.len() - (chunk_size + 1));
-        batches.push(batch);
-    }
-    while !jobs.is_empty() {
-        batches.push(jobs.split_off(jobs.len().saturating_sub(chunk_size)));
-    }
-
-    batches
 }
 
 async fn get_title_from_id(client: &Client, id: usize) -> anyhow::Result<(String, Url)> {
@@ -224,57 +121,6 @@ fn select_chapters(mut chapters: Vec<Chapter>) -> anyhow::Result<Vec<Chapter>> {
         }
         None => Err(ScraperErrors::InvalidChapterSelection.into()),
     }
-}
-
-async fn download_chapters(
-    client: &Client,
-    chapters: &Vec<Chapter>,
-    manga_path: &Path,
-    chapter_progress: &ProgressBar,
-    total_progress: &ProgressBar,
-) -> Vec<Chapter> {
-    chapter_progress.tick();
-    let mut failed_chapter_downloads = vec![];
-
-    for chapter @ Chapter {
-        url,
-        title: chapter_title,
-    } in chapters
-    {
-        chapter_progress.set_message(format!("downloading {chapter_title}"));
-
-        let chapter_url = format!("{HOST_URL}{url}");
-        match download_chapter(
-            client,
-            &chapter_url,
-            &manga_path.join(chapter_title),
-            chapter_progress,
-        )
-        .await
-        {
-            Ok(failed_pages) => {
-                if !failed_pages.is_empty() {
-                    error!(
-                        "{chapter_title}: failed to download {} pages",
-                        failed_pages.len()
-                    );
-                    failed_chapter_downloads.push(chapter.clone());
-                }
-            }
-            Err(err) => {
-                debug!("{err}");
-                error!("failed to fetch: {url}");
-                failed_chapter_downloads.push(chapter.clone());
-            }
-        };
-
-        chapter_progress.inc(1);
-        total_progress.inc(1);
-    }
-
-    chapter_progress.finish();
-
-    failed_chapter_downloads
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -349,7 +195,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let mut selected_chapters = match select_chapters(all_chapters) {
+    let selected_chapters = match select_chapters(all_chapters) {
         Ok(selected_chapters) => {
             info!(
                 "selected chapters [{} - {}]",
@@ -374,67 +220,144 @@ async fn main() -> anyhow::Result<()> {
             .inspect_err(|e| error!("{e}"))?;
     }
 
-    let multi_progress = MultiProgress::new();
-    let multi_progress_style = ProgressStyle::with_template(
-        "{spinner:.yellow} [{bar:60.yellow/white}] {pos:>4}/{len} chaps - {msg}",
+    let amqp_addr = "amqp://127.0.0.1:5672/%2f";
+    let conn = Connection::connect_uri(
+        AMQPUri::from_str(amqp_addr).unwrap_or_else(|err| {
+            error!("{err}");
+            std::process::exit(1);
+        }),
+        ConnectionProperties::default().with_connection_name("chapter_queue".into()),
     )
-    .unwrap()
-    .tick_chars("⠒⠖⠔⠴⠤⠦⠢⠲ ")
-    .progress_chars("-Cco");
+    .await?;
+    info!("connected to queue service");
+    let send_channel = conn.create_channel().await?;
+    send_channel
+        .queue_declare(
+            "chapter_queue",
+            QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await?;
+    send_channel
+        .queue_purge("chapter_queue", QueuePurgeOptions::default())
+        .await?;
 
-    let total_progress = multi_progress.add(
-        ProgressBar::new(num_chapters.try_into().unwrap()).with_style(
-            ProgressStyle::with_template(
-                "  [{bar:60.green/blue}] {pos:>4}/{len} chaps [{elapsed_precise}]{msg}",
-            )
-            .unwrap()
-            .progress_chars("█▓▒░ "),
-        ),
+    let reply_channel = conn.create_channel().await?;
+    reply_channel
+        .queue_declare(
+            "chapter_completed_queue",
+            QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await?;
+    reply_channel
+        .queue_purge("chapter_completed_queue", QueuePurgeOptions::default())
+        .await?;
+
+    let total_progress = ProgressBar::new(num_chapters.try_into().unwrap()).with_style(
+        ProgressStyle::with_template(
+            "  [{bar:60.green/blue}] {pos:>4}/{len} chaps [{elapsed_precise}]{msg}",
+        )
+        .unwrap()
+        .progress_chars("█▓▒░ "),
     );
     total_progress.enable_steady_tick(Duration::from_millis(250));
 
-    let num_threads = args.threads.min(num_chapters);
-    let batches = split_jobs(&mut selected_chapters, num_threads);
+    let mut reply_consumer = reply_channel
+        .basic_consume(
+            "chapter_completed_queue",
+            "main",
+            BasicConsumeOptions::default(),
+            FieldTable::default(),
+        )
+        .await?;
+    let total_progress_clone = total_progress.clone();
+    let reply_handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+        while let Some(delivery) = reply_consumer.next().await {
+            match delivery {
+                Ok(delivery) => {
+                    if let Ok(Chapter { .. }) =
+                        rkyv::from_bytes::<Chapter, rancor::Error>(&delivery.data)
+                    {
+                        total_progress_clone.inc(1);
 
-    let mut tasks: Vec<_> = vec![];
-    for batch in batches {
-        let client = client.clone();
-        let book_path = book_path.clone();
+                        delivery.ack(BasicAckOptions::default()).await?;
 
-        let chapter_progress = multi_progress.insert_before(
-            &total_progress,
-            ProgressBar::new(batch.len().try_into().unwrap())
-                .with_style(multi_progress_style.clone()),
-        );
-
-        let total_progress = total_progress.clone();
-
-        tasks.push(tokio::spawn(async move {
-            let failed_chapters = download_chapters(
-                &client,
-                &batch,
-                &book_path,
-                &chapter_progress,
-                &total_progress,
-            )
-            .await;
-            chapter_progress.finish_and_clear();
-
-            failed_chapters
-        }));
-    }
-    let mut all_failed_chapters = vec![];
-    let start_time = Local::now();
-    for task in tasks {
-        match task.await {
-            Ok(failed_chapters) => {
-                all_failed_chapters.extend(failed_chapters);
-            }
-            Err(e) => {
-                error!("{e}");
+                        if total_progress_clone.position() == total_progress_clone.length().unwrap()
+                        {
+                            break;
+                        }
+                    } else {
+                        delivery.ack(BasicAckOptions::default()).await?;
+                    }
+                }
+                Err(err) => {
+                    error!("{err}");
+                }
             }
         }
+        reply_channel
+            .basic_cancel("main", BasicCancelOptions::default())
+            .await?;
+
+        Ok(())
+    });
+
+    let num_workers = args.threads.min(num_chapters);
+    let workers: Vec<_> = (0..num_workers)
+        .filter_map(|_| {
+            std::process::Command::new("./target/release/worker")
+                .arg(book_path.to_str().unwrap())
+                .spawn()
+                .ok()
+        })
+        .collect();
+    if workers.is_empty() {
+        error!("failed to spawn workers");
+        std::process::exit(1);
     }
+
+    let start_time = Local::now();
+    for chapter in selected_chapters {
+        let confirm = send_channel
+            .basic_publish(
+                "",
+                "chapter_queue",
+                BasicPublishOptions::default(),
+                &rkyv::to_bytes::<rancor::Error>(&chapter).unwrap(),
+                BasicProperties::default().with_delivery_mode(2),
+            )
+            .await?
+            .await?;
+    }
+    for _ in 0..workers.len() {
+        let confirm = send_channel
+            .basic_publish(
+                "",
+                "chapter_queue",
+                BasicPublishOptions::default(),
+                "end".as_bytes(),
+                BasicProperties::default().with_delivery_mode(2),
+            )
+            .await?
+            .await?;
+    }
+    let mut all_failed_chapters = vec![];
+
+    for mut worker in workers {
+        let exit_status = worker.wait()?;
+    }
+    reply_handle.await?;
+    send_channel
+        .basic_cancel("main", BasicCancelOptions::default())
+        .await?;
+
     let end_time = Local::now();
     let download_duration = end_time.signed_duration_since(start_time);
     info!(
