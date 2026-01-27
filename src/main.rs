@@ -2,7 +2,6 @@ use std::{io::Write, path::Path, str::FromStr, time::Duration};
 
 use chrono::Local;
 use clap::Parser;
-use dialoguer::{Select, console::Style, theme::ColorfulTheme};
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use lapin::{
@@ -16,77 +15,17 @@ use lapin::{
 };
 use log::{debug, error, info};
 use reqwest::{
-    Client, Url,
+    Client,
     header::{self, HeaderMap, HeaderValue},
 };
 use rkyv::rancor;
-use scraper::Selector;
 use tokio::{fs, task::JoinHandle};
 
-use mangapill_scraper::{errors::ScraperErrors, models::Chapter, ui::select_chapter_range};
-
-async fn fetch_chapters_urls(client: &Client, title_url: &str) -> anyhow::Result<Vec<Chapter>> {
-    let html_content = client.get(title_url).send().await?.text().await?;
-    let doc = scraper::Html::parse_document(&html_content);
-
-    let selector = Selector::parse("#chapters a").unwrap();
-    let chapters = doc.select(&selector);
-    Ok(chapters
-        .map(|a| {
-            let mut title = a
-                .attr("title")
-                .unwrap_or_default()
-                .trim()
-                .to_ascii_lowercase()
-                .to_string();
-            title = title.replace('/', "-");
-            let chapter_num_pos = title.rfind(char::is_whitespace).unwrap_or_default();
-            let chapter_num_str = title.split_off(chapter_num_pos + 1);
-            let number_width = if let Some(i) = chapter_num_str.rfind('.') {
-                chapter_num_str.len() - i + 4
-            } else {
-                4
-            };
-
-            Chapter {
-                url: a.attr("href").unwrap_or_default().to_string(),
-                title: format!("{title}{chapter_num_str:0>number_width$}"),
-            }
-        })
-        .rev()
-        .collect())
-}
-
-async fn get_title_from_id(client: &Client, id: usize) -> anyhow::Result<(String, Url)> {
-    let response = client.get(format!("{HOST_URL}/manga/{id}")).send().await?;
-    let url = response.url();
-    match url.path_segments() {
-        Some(mut segments) => {
-            let title = segments.next_back().unwrap();
-            if title.parse::<usize>().is_ok() {
-                Err(ScraperErrors::InvalidBookId(id).into())
-            } else {
-                Ok((title.to_string(), url.clone()))
-            }
-        }
-        None => Err(ScraperErrors::InvalidBookId(id).into()),
-    }
-}
-
-async fn get_manga_display_name(client: &Client, url: &str) -> anyhow::Result<Option<String>> {
-    let html_content = client.get(url).send().await?.text().await?;
-    let doc = scraper::Html::parse_document(&html_content);
-
-    let selector = Selector::parse("h1").unwrap();
-    let mut h1 = doc.select(&selector);
-    Ok(h1
-        .next()
-        .or_else(|| {
-            error!("failed to get title");
-            None
-        })
-        .map(|e| e.text().collect::<String>()))
-}
+use mangapill_scraper::{
+    fetch::{fetch_chapters_urls, get_manga_display_name, get_title_from_id},
+    models::Chapter,
+    ui::select_chapter_range,
+};
 
 #[derive(Parser, Debug, Clone)]
 struct Args {
