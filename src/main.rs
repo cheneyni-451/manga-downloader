@@ -11,7 +11,6 @@ use lapin::{
         BasicAckOptions, BasicCancelOptions, BasicConsumeOptions, BasicPublishOptions,
         QueueDeclareOptions, QueuePurgeOptions,
     },
-    protocol::confirm,
     types::FieldTable,
     uri::AMQPUri,
 };
@@ -24,7 +23,7 @@ use rkyv::rancor;
 use scraper::Selector;
 use tokio::{fs, task::JoinHandle};
 
-use mangapill_scraper::{errors::ScraperErrors, models::Chapter};
+use mangapill_scraper::{errors::ScraperErrors, models::Chapter, ui::select_chapter_range};
 
 async fn fetch_chapters_urls(client: &Client, title_url: &str) -> anyhow::Result<Vec<Chapter>> {
     let html_content = client.get(title_url).send().await?.text().await?;
@@ -87,40 +86,6 @@ async fn get_manga_display_name(client: &Client, url: &str) -> anyhow::Result<Op
             None
         })
         .map(|e| e.text().collect::<String>()))
-}
-
-fn select_chapters(mut chapters: Vec<Chapter>) -> anyhow::Result<Vec<Chapter>> {
-    let selection_theme = ColorfulTheme {
-        prompt_style: Style::default().blue(),
-        active_item_style: Style::default().reverse(),
-        ..Default::default()
-    };
-    let chapter_selection_start = Select::with_theme(&selection_theme)
-        .with_prompt("First of the chapters to download")
-        .items(&chapters)
-        .max_length(10)
-        .interact_opt()?;
-    match chapter_selection_start {
-        Some(start_selection) => {
-            debug!("selected chapter range start index: {start_selection}");
-            chapters.drain(..start_selection);
-        }
-        None => return Err(ScraperErrors::InvalidChapterSelection.into()),
-    };
-
-    let chapter_selection_end = Select::with_theme(&selection_theme)
-        .with_prompt("Last of the chapters to download")
-        .items(&chapters)
-        .max_length(10)
-        .interact_opt()?;
-    match chapter_selection_end {
-        Some(end_selection) => {
-            debug!("selected chapter range end index: {end_selection}");
-            chapters.truncate(end_selection.saturating_add(1));
-            Ok(chapters)
-        }
-        None => Err(ScraperErrors::InvalidChapterSelection.into()),
-    }
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -195,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let selected_chapters = match select_chapters(all_chapters) {
+    let selected_chapters = match select_chapter_range(all_chapters) {
         Ok(selected_chapters) => {
             info!(
                 "selected chapters [{} - {}]",
