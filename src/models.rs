@@ -1,8 +1,6 @@
 use std::fmt::Display;
 
-use rkyv::{Archive, Deserialize, Serialize};
-
-#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Chapter {
     pub url: String,
     pub title: String,

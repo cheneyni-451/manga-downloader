@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use futures::StreamExt;
-use log::{debug, error};
+use log::{debug, error, info};
 use reqwest::{Client, Url};
 use scraper::Selector;
 use tokio::{fs, io::AsyncWriteExt};
@@ -102,6 +102,7 @@ pub async fn download_chapter(
 
     let image_urls = fetch_image_urls(client, chapter_url).await?;
 
+    info!("downloading {chapter_url}");
     let tasks = futures::stream::iter(image_urls)
         .enumerate()
         .map(|(page_num, page_url)| async move {

@@ -1,25 +1,15 @@
-use std::{io::Write, path::Path, str::FromStr, time::Duration};
+use std::{io::Write, path::Path, time::Duration};
 
 use chrono::Local;
 use clap::Parser;
-use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
-use lapin::{
-    BasicProperties, Connection, ConnectionProperties,
-    options::{
-        BasicAckOptions, BasicCancelOptions, BasicConsumeOptions, BasicPublishOptions,
-        QueueDeclareOptions, QueuePurgeOptions,
-    },
-    types::FieldTable,
-    uri::AMQPUri,
-};
 use log::{debug, error, info};
+use redis::{Commands, RedisResult};
 use reqwest::{
     Client,
     header::{self, HeaderMap, HeaderValue},
 };
-use rkyv::rancor;
-use tokio::{fs, task::JoinHandle};
+use tokio::{fs, time::sleep};
 
 use mangapill_scraper::{
     fetch::{fetch_chapters_urls, get_manga_display_name, get_title_from_id},
@@ -40,6 +30,8 @@ struct Args {
 }
 
 const HOST_URL: &str = "https://mangapill.com";
+const STREAM_KEY: &str = "mangapill_scraper_queue";
+const CONSUMER_GROUP: &str = "mangapill_scraper_workers";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -124,45 +116,12 @@ async fn main() -> anyhow::Result<()> {
             .inspect_err(|e| error!("{e}"))?;
     }
 
-    let amqp_addr = "amqp://127.0.0.1:5672/%2f";
-    let conn = Connection::connect_uri(
-        AMQPUri::from_str(amqp_addr).unwrap_or_else(|err| {
-            error!("{err}");
-            std::process::exit(1);
-        }),
-        ConnectionProperties::default().with_connection_name("chapter_queue".into()),
-    )
-    .await?;
+    let Ok(mut redis_client) = redis::Client::open("redis://127.0.0.1/") else {
+        error!("failed to connect to Redis");
+        std::process::exit(1);
+    };
     info!("connected to queue service");
-    let send_channel = conn.create_channel().await?;
-    send_channel
-        .queue_declare(
-            "chapter_queue",
-            QueueDeclareOptions {
-                durable: true,
-                ..Default::default()
-            },
-            FieldTable::default(),
-        )
-        .await?;
-    send_channel
-        .queue_purge("chapter_queue", QueuePurgeOptions::default())
-        .await?;
-
-    let reply_channel = conn.create_channel().await?;
-    reply_channel
-        .queue_declare(
-            "chapter_completed_queue",
-            QueueDeclareOptions {
-                durable: true,
-                ..Default::default()
-            },
-            FieldTable::default(),
-        )
-        .await?;
-    reply_channel
-        .queue_purge("chapter_completed_queue", QueuePurgeOptions::default())
-        .await?;
+    let _: RedisResult<()> = redis_client.xgroup_create_mkstream(STREAM_KEY, CONSUMER_GROUP, 0);
 
     let total_progress = ProgressBar::new(num_chapters.try_into().unwrap()).with_style(
         ProgressStyle::with_template(
@@ -173,50 +132,13 @@ async fn main() -> anyhow::Result<()> {
     );
     total_progress.enable_steady_tick(Duration::from_millis(250));
 
-    let mut reply_consumer = reply_channel
-        .basic_consume(
-            "chapter_completed_queue",
-            "main",
-            BasicConsumeOptions::default(),
-            FieldTable::default(),
-        )
-        .await?;
-    let total_progress_clone = total_progress.clone();
-    let reply_handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-        while let Some(delivery) = reply_consumer.next().await {
-            match delivery {
-                Ok(delivery) => {
-                    if let Ok(Chapter { .. }) =
-                        rkyv::from_bytes::<Chapter, rancor::Error>(&delivery.data)
-                    {
-                        total_progress_clone.inc(1);
-
-                        delivery.ack(BasicAckOptions::default()).await?;
-
-                        if total_progress_clone.position() == total_progress_clone.length().unwrap()
-                        {
-                            break;
-                        }
-                    } else {
-                        delivery.ack(BasicAckOptions::default()).await?;
-                    }
-                }
-                Err(err) => {
-                    error!("{err}");
-                }
-            }
-        }
-        reply_channel
-            .basic_cancel("main", BasicCancelOptions::default())
-            .await?;
-
-        Ok(())
-    });
-
     let num_workers = args.threads.min(num_chapters);
     let workers: Vec<_> = (0..num_workers)
-        .filter_map(|_| {
+        .filter_map(|i| {
             std::process::Command::new("./target/release/worker")
+                .arg(STREAM_KEY)
+                .arg(CONSUMER_GROUP)
+                .arg(format!("worker-{i}"))
                 .arg(book_path.to_str().unwrap())
                 .spawn()
                 .ok()
@@ -229,38 +151,48 @@ async fn main() -> anyhow::Result<()> {
 
     let start_time = Local::now();
     for chapter in selected_chapters {
-        let confirm = send_channel
-            .basic_publish(
-                "",
-                "chapter_queue",
-                BasicPublishOptions::default(),
-                &rkyv::to_bytes::<rancor::Error>(&chapter).unwrap(),
-                BasicProperties::default().with_delivery_mode(2),
-            )
-            .await?
-            .await?;
+        let res: RedisResult<String> = redis_client.xadd(
+            STREAM_KEY,
+            "*",
+            &[("title", chapter.title), ("url", chapter.url)],
+        );
     }
-    for _ in 0..workers.len() {
-        let confirm = send_channel
-            .basic_publish(
-                "",
-                "chapter_queue",
-                BasicPublishOptions::default(),
-                "end".as_bytes(),
-                BasicProperties::default().with_delivery_mode(2),
-            )
-            .await?
-            .await?;
+
+    let mut redis_client_clone = redis_client.clone();
+    let total_progress_clone = total_progress.clone();
+    let ticker_handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(250));
+
+        loop {
+            ticker.tick().await;
+            let num_tasks_remaining: RedisResult<usize> = redis_client_clone.xlen(STREAM_KEY);
+            total_progress_clone.set_position(
+                (num_chapters.saturating_sub(num_tasks_remaining.unwrap_or(num_chapters))) as u64,
+            );
+        }
+    });
+
+    loop {
+        if let Ok(remaining_requests) = redis_client.xlen::<&str, u64>(STREAM_KEY)
+            && remaining_requests == 0
+        {
+            break;
+        } else {
+            sleep(Duration::from_secs(1)).await;
+        }
     }
+    ticker_handle.abort();
+    if let Ok(1) = redis_client.xgroup_destroy(STREAM_KEY, CONSUMER_GROUP) {
+        debug!("destroyed consumer group");
+    } else {
+        debug!("failed to destroy consumer group");
+    }
+
     let mut all_failed_chapters = vec![];
 
     for mut worker in workers {
-        let exit_status = worker.wait()?;
+        let exit_status = worker.wait();
     }
-    reply_handle.await?;
-    send_channel
-        .basic_cancel("main", BasicCancelOptions::default())
-        .await?;
 
     let end_time = Local::now();
     let download_duration = end_time.signed_duration_since(start_time);

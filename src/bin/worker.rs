@@ -1,25 +1,38 @@
-use std::{path::PathBuf, str::FromStr};
+use std::{io::Write, path::PathBuf, str::FromStr, time::Duration};
 
+use chrono::Local;
 use clap::Parser;
-use futures::StreamExt;
-use lapin::{
-    BasicProperties, Connection, ConnectionProperties,
-    options::{
-        BasicAckOptions, BasicCancelOptions, BasicConsumeOptions, BasicPublishOptions,
-        BasicQosOptions, QueueDeclareOptions,
+use log::{error, info};
+use mangapill_scraper::fetch::download_chapter;
+use redis::{
+    Commands, RedisResult,
+    streams::{
+        StreamAutoClaimOptions, StreamAutoClaimReply, StreamClaimReply, StreamDeletionPolicy,
+        StreamInfoConsumersReply, StreamReadOptions, StreamReadReply, XDelExStatusCode,
     },
-    types::FieldTable,
-    uri::AMQPUri,
 };
-use mangapill_scraper::{fetch::download_chapter, models::Chapter};
 use reqwest::{
     ClientBuilder,
     header::{self, HeaderMap, HeaderValue},
 };
-use rkyv::rancor;
+
+#[derive(Clone)]
+struct Task {
+    title: String,
+    url: String,
+}
 
 #[derive(Parser, Debug, Clone)]
 struct Args {
+    #[arg(required = true, help = "stream key")]
+    key: String,
+
+    #[arg(required = true, help = "consumer group")]
+    group: String,
+
+    #[arg(required = true, help = "unique name of worker")]
+    worker_id: String,
+
     #[arg(required = true, help = "path of the output directory")]
     manga_path: String,
 }
@@ -30,103 +43,180 @@ const HOST_URL: &str = "https://mangapill.com";
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let amqp_addr = "amqp://127.0.0.1:5672/%2f";
-    let conn = Connection::connect_uri(
-        AMQPUri::from_str(amqp_addr).unwrap_or_else(|err| {
-            eprintln!("{err}");
-            std::process::exit(1);
-        }),
-        ConnectionProperties::default().with_connection_name("chapter_queue_worker".into()),
-    )
-    .await?;
+    let log_file = format!("log-{}.txt", args.worker_id.clone());
+    let log_target = Box::new(
+        std::fs::File::create(log_file.clone())
+            .unwrap_or_else(|_| panic!("Failed to create {log_file}")),
+    );
+    env_logger::Builder::new()
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "{} [{}] {}",
+                Local::now().format("%Y-%m-%dT%H:%M:%S%.6f"),
+                record.level(),
+                record.args(),
+            )
+        })
+        .target(env_logger::Target::Pipe(log_target))
+        .filter(Some("worker"), log::LevelFilter::Info)
+        .filter(Some("mangapill_scraper"), log::LevelFilter::Info)
+        .init();
 
-    let recv_channel = conn.create_channel().await?;
-    let send_channel = conn.create_channel().await?;
-    send_channel
-        .queue_declare(
-            "chapter_completed_queue",
-            QueueDeclareOptions {
-                durable: true,
-                ..Default::default()
-            },
-            FieldTable::default(),
-        )
-        .await?;
+    let Ok(mut redis_client) = redis::Client::open("redis://127.0.0.1/") else {
+        error!("failed to connect to Redis server");
+        std::process::exit(1);
+    };
+    let valid_consumer_id = match redis_client.xinfo_consumers(args.key.clone(), args.group.clone())
+    {
+        Ok(StreamInfoConsumersReply { consumers }) => {
+            if consumers
+                .iter()
+                .find(|consumer| consumer.name == args.worker_id)
+                .is_some()
+            {
+                error!("consumer with name '{}' already exists", args.worker_id);
+                false
+            } else {
+                true
+            }
+        }
+        Err(err) => {
+            error!("{err}");
+            false
+        }
+    };
 
-    const QUEUE_NAME: &str = "chapter_queue";
-
-    recv_channel
-        .queue_declare(
-            QUEUE_NAME,
-            QueueDeclareOptions {
-                durable: true,
-                ..Default::default()
-            },
-            FieldTable::default(),
-        )
-        .await?;
-
-    recv_channel
-        .basic_qos(1, BasicQosOptions::default())
-        .await?;
-    let mut consumer = recv_channel
-        .basic_consume(
-            QUEUE_NAME,
-            "worker",
-            BasicConsumeOptions::default(),
-            FieldTable::default(),
-        )
-        .await?;
-
+    if !valid_consumer_id {
+        std::process::exit(1);
+    }
     let manga_path = PathBuf::from_str(&args.manga_path)?;
-    let mut headers = HeaderMap::new();
-    headers.insert(header::REFERER, HeaderValue::from_static(HOST_URL));
-    let client = ClientBuilder::new()
+    let headers = HeaderMap::from_iter([(header::REFERER, HeaderValue::from_static(HOST_URL))]);
+    let req_client = ClientBuilder::new()
         .default_headers(headers)
         .user_agent("Mozilla/5.0 (X11; Linux x86_64; rv:145.0) Gecko/20100101 Firefox/145.0")
         .build()?;
 
-    while let Some(delivery) = consumer.next().await {
-        match delivery {
-            Ok(delivery) => {
-                if let Ok(
-                    chapter @ Chapter {
-                        url,
-                        title: chapter_title,
-                    },
-                ) = &rkyv::from_bytes::<Chapter, rancor::Error>(&delivery.data)
-                {
-                    let chapter_url = format!("{HOST_URL}{url}");
-                    let _failed_pages =
-                        download_chapter(&client, &chapter_url, &manga_path.join(chapter_title))
-                            .await?;
+    const MIN_IDLE_TIME: u64 = 30_000;
 
-                    delivery.ack(BasicAckOptions::default()).await?;
-                    send_channel
-                        .basic_publish(
-                            "",
-                            "chapter_completed_queue",
-                            BasicPublishOptions::default(),
-                            &rkyv::to_bytes::<rancor::Error>(chapter).unwrap(),
-                            BasicProperties::default().with_delivery_mode(2),
-                        )
-                        .await?
-                        .await?;
+    loop {
+        let autoclaim_options = StreamAutoClaimOptions::default().count(1);
+        let read_options = StreamReadOptions::default()
+            .count(1)
+            .block(10)
+            .group(args.group.clone(), args.worker_id.clone());
+
+        let id_task: Option<(String, Task)> = match redis_client.xautoclaim_options(
+            args.key.clone(),
+            args.group.clone(),
+            args.worker_id.clone(),
+            MIN_IDLE_TIME,
+            0,
+            autoclaim_options,
+        ) {
+            Ok(StreamAutoClaimReply { claimed, .. }) => {
+                if claimed.is_empty() {
+                    match redis_client.xread_options(
+                        std::slice::from_ref(&args.key),
+                        &[">"],
+                        &read_options,
+                    ) {
+                        Ok(StreamReadReply { keys }) => {
+                            if let Some(ids) = keys.first()
+                                && let Some(claimed) = ids.ids.first()
+                                && let Some(title) = claimed.get("title")
+                                && let Some(url) = claimed.get("url")
+                            {
+                                Some((claimed.id.clone(), Task { title, url }))
+                            } else {
+                                None
+                            }
+                        }
+                        Err(err) => {
+                            error!("{err}");
+                            break;
+                        }
+                    }
                 } else {
-                    delivery.ack(BasicAckOptions::default()).await?;
-                    break;
+                    if let Some(claimed) = claimed.first()
+                        && let Some(title) = claimed.get("title")
+                        && let Some(url) = claimed.get("url")
+                    {
+                        Some((claimed.id.clone(), Task { title, url }))
+                    } else {
+                        None
+                    }
                 }
             }
             Err(err) => {
-                eprintln!("{err}");
+                error!("{err}");
                 break;
             }
-        }
-    }
+        };
 
-    recv_channel
-        .basic_cancel("worker", BasicCancelOptions::default())
-        .await?;
+        // Didn't get a task
+        if id_task.is_none() {
+            let num_pending_msgs_result: RedisResult<usize> = redis_client.xgroup_delconsumer(
+                args.key.clone(),
+                args.group.clone(),
+                args.worker_id.clone(),
+            );
+            match num_pending_msgs_result {
+                Ok(num_pending_msgs) => {
+                    info!(
+                        "deleted consumer {} with {num_pending_msgs} pending messages",
+                        args.worker_id.clone()
+                    );
+                }
+                Err(err) => {
+                    error!("{err}");
+                    error!("failed to delete consumer {}", args.worker_id.clone());
+                }
+            };
+            break;
+        }
+
+        // work on task
+        let (
+            task_id,
+            Task {
+                title: chapter_title,
+                url,
+            },
+        ) = id_task.unwrap();
+
+        let task_id_clone = task_id.clone();
+        let args_clone = args.clone();
+        let mut redis_client_clone = redis_client.clone();
+        let ticker_handle = tokio::spawn(async move {
+            let mut claim_ticker = tokio::time::interval(Duration::from_secs(5));
+
+            loop {
+                claim_ticker.tick().await;
+                let res: RedisResult<StreamClaimReply> = redis_client_clone.xclaim(
+                    args_clone.key.clone(),
+                    args_clone.group.clone(),
+                    args_clone.worker_id.clone(),
+                    0,
+                    std::slice::from_ref(&task_id_clone),
+                );
+            }
+        });
+
+        let chapter_url = format!("{HOST_URL}{url}");
+        let chapter_path = manga_path.join(chapter_title);
+        let _failed_pages = download_chapter(&req_client, &chapter_url, &chapter_path).await;
+
+        if let Err(err) = redis_client.xack_del::<String, String, String, Vec<XDelExStatusCode>>(
+            args.key.clone(),
+            args.group.clone(),
+            std::slice::from_ref(&task_id),
+            StreamDeletionPolicy::DelRef,
+        ) {
+            error!("{err}");
+        }
+        ticker_handle.abort();
+    }
 
     Ok(())
 }
