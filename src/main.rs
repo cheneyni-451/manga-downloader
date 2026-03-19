@@ -116,12 +116,11 @@ async fn main() -> anyhow::Result<()> {
             .inspect_err(|e| error!("{e}"))?;
     }
 
-    let Ok(mut redis_client) = redis::Client::open("redis://127.0.0.1/") else {
-        error!("failed to connect to Redis");
-        std::process::exit(1);
-    };
+    let redis_client = redis::Client::open("redis://127.0.0.1/")?;
+    let redis_pool = r2d2::Pool::builder().build(redis_client)?;
+    let mut redis_conn = redis_pool.get().unwrap();
     info!("connected to queue service");
-    let _: RedisResult<()> = redis_client.xgroup_create_mkstream(STREAM_KEY, CONSUMER_GROUP, 0);
+    let _: RedisResult<()> = redis_conn.xgroup_create_mkstream(STREAM_KEY, CONSUMER_GROUP, 0);
 
     let total_progress = ProgressBar::new(num_chapters.try_into().unwrap()).with_style(
         ProgressStyle::with_template(
@@ -151,21 +150,21 @@ async fn main() -> anyhow::Result<()> {
 
     let start_time = Local::now();
     for chapter in selected_chapters {
-        let res: RedisResult<String> = redis_client.xadd(
+        let res: RedisResult<String> = redis_conn.xadd(
             STREAM_KEY,
             "*",
             &[("title", chapter.title), ("url", chapter.url)],
         );
     }
 
-    let mut redis_client_clone = redis_client.clone();
     let total_progress_clone = total_progress.clone();
     let ticker_handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(250));
+        let mut redis_conn = redis_pool.get().unwrap();
 
         loop {
             ticker.tick().await;
-            let num_tasks_remaining: RedisResult<usize> = redis_client_clone.xlen(STREAM_KEY);
+            let num_tasks_remaining: RedisResult<usize> = redis_conn.xlen(STREAM_KEY);
             total_progress_clone.set_position(
                 (num_chapters.saturating_sub(num_tasks_remaining.unwrap_or(num_chapters))) as u64,
             );
@@ -173,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     loop {
-        if let Ok(remaining_requests) = redis_client.xlen::<&str, u64>(STREAM_KEY)
+        if let Ok(remaining_requests) = redis_conn.xlen::<&str, u64>(STREAM_KEY)
             && remaining_requests == 0
         {
             break;
@@ -182,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     ticker_handle.abort();
-    if let Ok(1) = redis_client.xgroup_destroy(STREAM_KEY, CONSUMER_GROUP) {
+    if let Ok(1) = redis_conn.xgroup_destroy(STREAM_KEY, CONSUMER_GROUP) {
         debug!("destroyed consumer group");
     } else {
         debug!("failed to destroy consumer group");
